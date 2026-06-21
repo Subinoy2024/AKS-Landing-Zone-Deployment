@@ -5,14 +5,30 @@ trigger:
     - feature/akslz1.0
   paths:
     include:
-    - '**/*.tf'
-
+    - '**/*.tf'  
+    # Note:Only trigger when files matching this pattern change
+    # ** = any folder level
+    # *.tf = any Terraform file
+    #Run the Azure DevOps pipeline only when:
+    #A change is pushed to branch:
+   #feature/akslz1.0
+  #AND 2. At least one Terraform (.tf) file is modified.
 
 parameters:
+
+# Parameter name used inside the pipeline
 - name: environment
+
+  # Label displayed in Azure DevOps UI
   displayName: 'Target Environment'
+
+  # Data type
   type: string
+
+  # Default value if user doesn't select anything
   default: 'dev'
+
+  # Allowed values
   values:
   - dev
   - qa
