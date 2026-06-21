@@ -2,15 +2,11 @@
 trigger:
   branches:
     include:
-    - main
+    - feature/akslz1.0
   paths:
     include:
     - '**/*.tf'
 
-pr:
-  branches:
-    include:
-    - main
 
 parameters:
 - name: environment
