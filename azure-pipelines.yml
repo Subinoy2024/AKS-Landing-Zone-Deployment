@@ -2,68 +2,71 @@
 trigger:
   branches:
     include:
-    - feature/akslz1.0
+    - main
   paths:
     include:
-    - '**/*.tf'  
-    # Note:Only trigger when files matching this pattern change
-    # ** = any folder level
-    # *.tf = any Terraform file
-    #Run the Azure DevOps pipeline only when:
-    #A change is pushed to branch:
-   #feature/akslz1.0
-  #AND 2. At least one Terraform (.tf) file is modified.
+    - '**/*.tf'
+    - '**/*.tfvars'
+    - 'modules/**'
+    - 'environments/**'
+
+pr: none   # PR pipeline is separate
+
+pool:
+  vmImage: 'ubuntu-latest'
 
 parameters:
-
-# Parameter name used inside the pipeline
 - name: environment
-
-  # Label displayed in Azure DevOps UI
   displayName: 'Target Environment'
-
-  # Data type
   type: string
-
-  # Default value if user doesn't select anything
   default: 'dev'
-
-  # Allowed values
   values:
   - dev
   - qa
   - prod
 
 variables:
-- name: tfVersion
-  value: '1.9.0'           # Update as needed
-- name: workingDirectory
-  value: '$(Build.SourcesDirectory)'
-- name: environmentName
-  value: ${{ parameters.environment }}
+  tfVersion: '1.9.0'
+  workingDirectory: '$(Build.SourcesDirectory)'
+  environmentName: ${{ parameters.environment }}
+  backendRG: 'REVA-RACE-PROJECT-ACCESS'
+  backendStorage: 'devopsracerevaprodccloud'
+  backendContainer: 'revaprotfstate'
 
 stages:
 
-- stage: Validate
-  displayName: 'Validate'
+# ========================================
+# STAGE 1: Validate & Plan (Always runs)
+# ========================================
+- stage: ValidateAndPlan
+  displayName: 'Validate & Plan'
   jobs:
-  - job: Validate
-    pool:
-      vmImage: 'ubuntu-latest'
+  - job: ValidatePlan
+    displayName: 'Terraform Validate & Plan'
     steps:
+
     - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
       inputs:
         terraformVersion: $(tfVersion)
 
+    - task: Bash@3
+      displayName: 'Terraform Format Check'
+      inputs:
+        targetType: 'inline'
+        script: terraform fmt -check -recursive
+        workingDirectory: $(workingDirectory)
+      failOnStderr: true
+
     - task: TerraformTaskV2@2
-      displayName: 'Terraform Init (Validate)'
+      displayName: 'Terraform Init'
       inputs:
         command: 'init'
         workingDirectory: '$(workingDirectory)'
-        backendServiceArm: 'AzureServiceConnection'   # ← Change to your service connection name
-        backendAzureRmResourceGroupName: 'tfstate-rg'
-        backendAzureRmStorageAccountName: 'yourstorageacct'
-        backendAzureRmContainerName: 'tfstate'
+        backendServiceArm: 'AzureServiceConnection'
+        backendAzureRmResourceGroupName: $(backendRG)
+        backendAzureRmStorageAccountName: $(backendStorage)
+        backendAzureRmContainerName: $(backendContainer)
         backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
 
     - task: TerraformTaskV2@2
@@ -72,28 +75,24 @@ stages:
         command: 'validate'
         workingDirectory: '$(workingDirectory)'
 
-- stage: Plan
-  displayName: 'Plan'
-  dependsOn: Validate
-  jobs:
-  - job: Plan
-    pool:
-      vmImage: 'ubuntu-latest'
-    steps:
-    - task: TerraformInstaller@1
+    - task: trivy@1
+      displayName: 'Trivy IaC Scan'
       inputs:
-        terraformVersion: $(tfVersion)
+        scanType: 'fs'
+        scanPath: '.'
+        format: 'table'
+        exitCode: '1'
+        severity: 'HIGH,CRITICAL'
 
-    - task: TerraformTaskV2@2
-      displayName: 'Terraform Init'
+    - task: Bash@3
+      displayName: 'Checkov Security Scan'
       inputs:
-        command: 'init'
-        workingDirectory: '$(workingDirectory)'
-        backendServiceArm: 'AzureServiceConnection'
-        backendAzureRmResourceGroupName: 'tfstate-rg'
-        backendAzureRmStorageAccountName: 'yourstorageacct'
-        backendAzureRmContainerName: 'tfstate'
-        backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
+        targetType: 'inline'
+        script: |
+          pip install checkov
+          checkov -d . --framework terraform --output cli --soft-fail
+        workingDirectory: $(workingDirectory)
+      failOnStderr: false
 
     - task: TerraformTaskV2@2
       displayName: 'Terraform Plan'
@@ -102,17 +101,21 @@ stages:
         workingDirectory: '$(workingDirectory)'
         environmentServiceName: 'AzureServiceConnection'
         commandOptions: '-var-file=environments/$(environmentName)/terraform.tfvars -out=tfplan'
-        publishPlanResults: 'Terraform Plan Results'
+        publishPlanResults: 'Terraform Plan - $(environmentName)'
 
     - publish: '$(workingDirectory)/tfplan'
       artifact: 'tfplan-$(environmentName)'
+      displayName: 'Publish Plan Artifact'
 
+# ========================================
+# STAGE 2: Manual Approval (QA & Prod only)
+# ========================================
 - stage: Approval
   displayName: 'Manual Approval'
-  dependsOn: Plan
+  dependsOn: ValidateAndPlan
   condition: and(succeeded(), ne(variables.environmentName, 'dev'))
   jobs:
-  - deployment: Approval
+  - deployment: ApprovalGate
     displayName: 'Approval for ${{ parameters.environment }}'
     environment: ${{ parameters.environment }}
     strategy:
@@ -121,24 +124,27 @@ stages:
           steps:
           - task: ManualValidation@0
             inputs:
-              notifyUsers: 'your-email@domain.com'
-              instructions: 'Review Terraform Plan and approve for ${{ parameters.environment }}'
+              notifyUsers: ''   # Add approver emails here
+              instructions: 'Review Terraform Plan for ${{ parameters.environment }} before deployment.'
 
-- stage: Apply
-  displayName: 'Apply'
+# ========================================
+# STAGE 3: Apply (Deployment)
+# ========================================
+- stage: Deploy
+  displayName: 'Deploy to ${{ parameters.environment }}'
   dependsOn: Approval
   condition: succeeded()
   jobs:
-  - deployment: Deploy
-    displayName: 'Deploy to ${{ parameters.environment }}'
+  - deployment: TerraformApply
+    displayName: 'Terraform Apply'
     environment: ${{ parameters.environment }}
-    pool:
-      vmImage: 'ubuntu-latest'
     strategy:
       runOnce:
         deploy:
           steps:
+
           - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
             inputs:
               terraformVersion: $(tfVersion)
 
@@ -151,9 +157,9 @@ stages:
               command: 'init'
               workingDirectory: '$(workingDirectory)'
               backendServiceArm: 'AzureServiceConnection'
-              backendAzureRmResourceGroupName: 'tfstate-rg'
-              backendAzureRmStorageAccountName: 'yourstorageacct'
-              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmResourceGroupName: $(backendRG)
+              backendAzureRmStorageAccountName: $(backendStorage)
+              backendAzureRmContainerName: $(backendContainer)
               backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
 
           - task: TerraformTaskV2@2
