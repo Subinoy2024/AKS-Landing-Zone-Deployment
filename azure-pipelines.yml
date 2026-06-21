@@ -1,0 +1,153 @@
+# .azure-pipelines/azure-pipelines.yml
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - '**/*.tf'
+
+pr:
+  branches:
+    include:
+    - main
+
+parameters:
+- name: environment
+  displayName: 'Target Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - qa
+  - prod
+
+variables:
+- name: tfVersion
+  value: '1.9.0'           # Update as needed
+- name: workingDirectory
+  value: '$(Build.SourcesDirectory)'
+- name: environmentName
+  value: ${{ parameters.environment }}
+
+stages:
+
+- stage: Validate
+  displayName: 'Validate'
+  jobs:
+  - job: Validate
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: $(tfVersion)
+
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Init (Validate)'
+      inputs:
+        command: 'init'
+        workingDirectory: '$(workingDirectory)'
+        backendServiceArm: 'AzureServiceConnection'   # ← Change to your service connection name
+        backendAzureRmResourceGroupName: 'tfstate-rg'
+        backendAzureRmStorageAccountName: 'yourstorageacct'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
+
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Validate'
+      inputs:
+        command: 'validate'
+        workingDirectory: '$(workingDirectory)'
+
+- stage: Plan
+  displayName: 'Plan'
+  dependsOn: Validate
+  jobs:
+  - job: Plan
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: $(tfVersion)
+
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Init'
+      inputs:
+        command: 'init'
+        workingDirectory: '$(workingDirectory)'
+        backendServiceArm: 'AzureServiceConnection'
+        backendAzureRmResourceGroupName: 'tfstate-rg'
+        backendAzureRmStorageAccountName: 'yourstorageacct'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
+
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Plan'
+      inputs:
+        command: 'plan'
+        workingDirectory: '$(workingDirectory)'
+        environmentServiceName: 'AzureServiceConnection'
+        commandOptions: '-var-file=environments/$(environmentName)/terraform.tfvars -out=tfplan'
+        publishPlanResults: 'Terraform Plan Results'
+
+    - publish: '$(workingDirectory)/tfplan'
+      artifact: 'tfplan-$(environmentName)'
+
+- stage: Approval
+  displayName: 'Manual Approval'
+  dependsOn: Plan
+  condition: and(succeeded(), ne(variables.environmentName, 'dev'))
+  jobs:
+  - deployment: Approval
+    displayName: 'Approval for ${{ parameters.environment }}'
+    environment: ${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: 'your-email@domain.com'
+              instructions: 'Review Terraform Plan and approve for ${{ parameters.environment }}'
+
+- stage: Apply
+  displayName: 'Apply'
+  dependsOn: Approval
+  condition: succeeded()
+  jobs:
+  - deployment: Deploy
+    displayName: 'Deploy to ${{ parameters.environment }}'
+    environment: ${{ parameters.environment }}
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(tfVersion)
+
+          - download: current
+            artifact: 'tfplan-$(environmentName)'
+
+          - task: TerraformTaskV2@2
+            displayName: 'Terraform Init (Apply)'
+            inputs:
+              command: 'init'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: 'AzureServiceConnection'
+              backendAzureRmResourceGroupName: 'tfstate-rg'
+              backendAzureRmStorageAccountName: 'yourstorageacct'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
+
+          - task: TerraformTaskV2@2
+            displayName: 'Terraform Apply'
+            inputs:
+              command: 'apply'
+              workingDirectory: '$(workingDirectory)'
+              environmentServiceName: 'AzureServiceConnection'
+              commandOptions: '-auto-approve tfplan'
