@@ -1,0 +1,151 @@
+# ==================================================================
+#  AIPP-generated Terraform infra workflow · provider hashicorp/azurerm + azurerm backend
+#  Uses HashiCorp's official `hashicorp/setup-terraform@v3` action
+#  plus community-standard actions for tflint / tfsec / conftest.
+#  Flow: validate → plan → policy → apply (manual approval).
+# ==================================================================
+name: AIPP Terraform - AKS-Landing-Zone-Deployment
+'on':
+  push:
+    branches:
+    - develop
+    - release/*
+    - main
+    tags:
+    - v*.*.*
+  pull_request:
+    branches:
+    - develop
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  # -----------------------------------------------------------
+  # JOB 1 · VALIDATE
+  # fmt + init + validate + tflint + tfsec (offline gates only)
+  # -----------------------------------------------------------
+  validate:
+    name: Validate (provider hashicorp/azurerm + azurerm backend)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT || '.' }}
+    steps:
+    - &id001
+      name: Checkout
+      uses: actions/checkout@v4
+    - &id002
+      name: Azure login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    - &id003
+      name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ vars.TF_VERSION || 'latest' }}
+        terraform_wrapper: false
+    - name: terraform fmt
+      run: terraform fmt -check -recursive
+    - name: terraform init
+      run: terraform init -input=false -backend-config=key=${{ vars.TF_BACKEND_KEY || format('{0}.tfstate', github.event.repository.name) }}
+    - name: terraform validate
+      run: terraform validate
+    - name: Setup tflint
+      uses: terraform-linters/setup-tflint@v4
+    - name: tflint
+      run: tflint --init && tflint --format=default --recursive
+    - name: Setup tfsec
+      uses: aquasecurity/tfsec-action@v1.0.3
+  # -----------------------------------------------------------
+  # JOB 2 · PLAN — produces `tfplan` artifact for apply stage
+  # -----------------------------------------------------------
+  plan:
+    name: Plan (produces tfplan artifact)
+    needs: validate
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT || '.' }}
+    steps:
+    - *id001
+    - *id002
+    - *id003
+    - name: terraform init
+      run: terraform init -input=false -backend-config=key=${{ vars.TF_BACKEND_KEY || format('{0}.tfstate', github.event.repository.name) }}
+    - name: terraform plan
+      run: 'terraform plan -input=false -out=tfplan -detailed-exitcode | tee plan.txt
+
+        terraform show -json tfplan > plan.json'
+    - name: Upload tfplan artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: tfplan
+        path: '${{ vars.TF_ROOT || ''.'' }}/tfplan
+
+          ${{ vars.TF_ROOT || ''.'' }}/plan.json
+
+          ${{ vars.TF_ROOT || ''.'' }}/plan.txt'
+        if-no-files-found: error
+        retention-days: 14
+  # -----------------------------------------------------------
+  # JOB 3 · POLICY — OPA/conftest + optional Terratest (soft-fail)
+  # -----------------------------------------------------------
+  policy:
+    name: Policy (OPA / conftest + Terratest)
+    needs: plan
+    runs-on: ubuntu-22.04
+    steps:
+    - *id001
+    - name: Download tfplan artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: tfplan
+        path: tfplan-artifact
+    - name: Install conftest
+      run: wget -qO /tmp/conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz &&
+        tar -xzf /tmp/conftest.tar.gz -C /tmp && sudo mv /tmp/conftest /usr/local/bin/
+    - name: OPA / conftest gate
+      continue-on-error: true
+      run: "if [ -d policy ]; then   conftest test tfplan-artifact/plan.json --policy policy; else   echo 'No ./policy directory found \u2014\
+        \ skipping OPA gate'; fi"
+    - name: Terratest (if present)
+      continue-on-error: true
+      run: "if [ -d tests ] && ls tests/*.go >/dev/null 2>&1; then   go test -v -timeout 60m ./tests/...; else   echo 'No Terratest suite under\
+        \ ./tests \u2014 skipping'; fi"
+  # -----------------------------------------------------------
+  # JOB 4 · APPLY — manual-approval `environment: production`
+  # Runs only on main or v*.*.* tags. Consumes tfplan artifact.
+  # -----------------------------------------------------------
+  apply:
+    name: Apply (manual approval required)
+    needs: policy
+    runs-on: ubuntu-22.04
+    environment: production
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    defaults:
+      run:
+        working-directory: ${{ vars.TF_ROOT || '.' }}
+    steps:
+    - *id001
+    - *id002
+    - *id003
+    - name: Download tfplan artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: tfplan
+        path: ${{ vars.TF_ROOT || '.' }}
+    - name: terraform init
+      run: terraform init -input=false -backend-config=key=${{ vars.TF_BACKEND_KEY || format('{0}.tfstate', github.event.repository.name) }}
+    - name: terraform apply (from artifact)
+      run: terraform apply -input=false -auto-approve tfplan
+    - name: terraform output
+      run: terraform output -json > outputs.json
+    - name: Upload terraform outputs
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-outputs
+        path: ${{ vars.TF_ROOT || '.' }}/outputs.json
+        retention-days: 90
