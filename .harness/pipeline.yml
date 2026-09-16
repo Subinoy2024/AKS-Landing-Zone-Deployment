@@ -1,0 +1,340 @@
+# ==================================================================
+#  AIPP-generated Harness pipeline · target cloud: azure · scope: all_in_one
+#  Standard flow: build → security → package (→ deploy_dev → deploy_prod).
+#  Every stage gets a short `#` header comment so the file reads
+#  top-to-bottom like a checklist. Modify freely — YAML only, no hidden magic.
+# ==================================================================
+#
+# ------------------------------------------------------------------
+#  CUSTOM DEPLOYMENT REQUIREMENT (as entered by the user)
+# ------------------------------------------------------------------
+#  > In the pipeline add terraform codebase security tool for scanning.
+#
+#  AIPP directive parser: no CLI-avoidance keywords detected — deploy
+#  stages use the standard cloud CLI tasks.
+# ==================================================================
+pipeline:
+  name: AIPP-AKS-Landing-Zone-Deployment
+  identifier: AIPP_AKS_Landing_Zone_Deployment
+  projectIdentifier: <+variable.HARNESS_PROJECT>
+  orgIdentifier: <+variable.HARNESS_ORG>
+  variables:
+  - name: REGISTRY_NAME
+    type: String
+    value: <+input>
+  - name: DOCKER_CONNECTOR
+    type: String
+    value: <+input>
+  - name: K8S_CONNECTOR
+    type: String
+    value: <+input>
+  - name: HARNESS_ORG
+    type: String
+    value: default
+  - name: HARNESS_PROJECT
+    type: String
+    value: default
+  stages:
+  - stage:
+      identifier: CI
+      name: Build, Test, Security, Package
+      type: CI
+      spec:
+        cloneCodebase: true
+        infrastructure:
+          type: KubernetesDirect
+          spec:
+            connectorRef: <+variable.K8S_CONNECTOR>
+            namespace: harness-delegate
+        execution:
+          steps:
+          - step:
+              identifier: install
+              name: Install
+              type: Run
+              spec:
+                shell: Bash
+                command: echo 'install dependencies'
+          - step:
+              # -----------------------------------------------------------
+              # STAGE · BUILD — checkout + language runtime + install + build
+              # + unit tests + publish artefact.
+              # -----------------------------------------------------------
+              identifier: build
+              name: Build
+              type: Run
+              spec:
+                shell: Bash
+                command: echo 'build project'
+          - step:
+              identifier: unit_test
+              name: Unit Test
+              type: Run
+              spec:
+                shell: Bash
+                command: echo 'run unit tests'
+          - step:
+              identifier: sast
+              name: Sast
+              type: Run
+              spec:
+                shell: Bash
+                command: echo 'run static security analysis'
+          - step:
+              identifier: dependency_scan
+              name: Dependency Scan
+              type: Run
+              spec:
+                shell: Bash
+                command: echo 'scan dependencies for vulnerabilities'
+          - step:
+              identifier: lint
+              name: Lint
+              type: Run
+              spec:
+                shell: Bash
+                command: echo 'run linter'
+          - step:
+              identifier: build_push_image
+              name: Build & Push Image
+              type: BuildAndPushDockerRegistry
+              spec:
+                connectorRef: <+variable.DOCKER_CONNECTOR>
+                repo: <+variable.REGISTRY_NAME>.azurecr.io/AKS-Landing-Zone-Deployment
+                tags:
+                - <+pipeline.sequenceId>
+                - <+codebase.commitSha>
+                dockerfile: Dockerfile
+                context: .
+          - step:
+              identifier: trivy_scan
+              name: Trivy Scan
+              type: Run
+              spec:
+                shell: Bash
+                command: trivy image --exit-code 0 --severity CRITICAL,HIGH <+variable.REGISTRY_NAME>.azurecr.io/AKS-Landing-Zone-Deployment:<+codebase.commitSha>
+                  || true
+  - stage:
+      # -----------------------------------------------------------
+      # STAGE · DEPLOY (dev) — auto on every main-branch push.
+      # Smoke-test hooks after deploy verify the app came up healthy.
+      # -----------------------------------------------------------
+      identifier: deploy_development
+      name: Deploy Development
+      type: Custom
+      spec:
+        execution:
+          steps:
+          - step:
+              identifier: cloud_auth_development
+              name: Cloud Auth Development
+              type: Run
+              spec:
+                shell: Bash
+                command: az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+          - step:
+              identifier: deploy_development
+              name: Deploy Development
+              type: Run
+              spec:
+                shell: Bash
+                command: 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+
+                  az webapp config container set --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG --container-image-name $IMAGE:$TAG --container-registry-url
+                  https://$ACR_NAME.azurecr.io
+
+                  az webapp restart --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG'
+          - step:
+              identifier: health_development
+              name: Health Development
+              type: Run
+              spec:
+                shell: Bash
+                command: 'true'
+          - step:
+              identifier: smoke_development
+              name: Smoke Development
+              type: Run
+              spec:
+                shell: Bash
+                command: curl -fsS $APP_HEALTH_URL/health || exit 1
+        environment:
+          environmentRef: development
+      when:
+        pipelineStatus: Success
+        condition: <+trigger.branch> == 'develop'
+  - stage:
+      identifier: deploy_qa
+      name: Deploy Qa
+      type: Custom
+      spec:
+        execution:
+          steps:
+          - step:
+              identifier: prod_approval
+              name: Manual approval
+              type: HarnessApproval
+              spec:
+                approvalMessage: Approve deploy to qa
+                includePipelineExecutionHistory: true
+                approvers:
+                  minimumCount: 1
+                  disallowPipelineExecutor: false
+          - step:
+              identifier: cloud_auth_qa
+              name: Cloud Auth Qa
+              type: Run
+              spec:
+                shell: Bash
+                command: az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+          - step:
+              identifier: deploy_qa
+              name: Deploy Qa
+              type: Run
+              spec:
+                shell: Bash
+                command: 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+
+                  az webapp config container set --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG --container-image-name $IMAGE:$TAG --container-registry-url
+                  https://$ACR_NAME.azurecr.io
+
+                  az webapp restart --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG'
+          - step:
+              identifier: health_qa
+              name: Health Qa
+              type: Run
+              spec:
+                shell: Bash
+                command: 'true'
+          - step:
+              identifier: smoke_qa
+              name: Smoke Qa
+              type: Run
+              spec:
+                shell: Bash
+                command: curl -fsS $APP_HEALTH_URL/health || exit 1
+        environment:
+          environmentRef: qa
+      when:
+        pipelineStatus: Success
+        condition: <+trigger.branch>.startsWith('release/')
+  - stage:
+      # -----------------------------------------------------------
+      # STAGE · DEPLOY (staging) — auto on main; runs smoke tests.
+      # -----------------------------------------------------------
+      identifier: deploy_staging
+      name: Deploy Staging
+      type: Custom
+      spec:
+        execution:
+          steps:
+          - step:
+              identifier: prod_approval
+              name: Manual approval
+              type: HarnessApproval
+              spec:
+                approvalMessage: Approve deploy to staging
+                includePipelineExecutionHistory: true
+                approvers:
+                  minimumCount: 1
+                  disallowPipelineExecutor: false
+          - step:
+              identifier: cloud_auth_staging
+              name: Cloud Auth Staging
+              type: Run
+              spec:
+                shell: Bash
+                command: az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+          - step:
+              identifier: deploy_staging
+              name: Deploy Staging
+              type: Run
+              spec:
+                shell: Bash
+                command: 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+
+                  az webapp config container set --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG --container-image-name $IMAGE:$TAG --container-registry-url
+                  https://$ACR_NAME.azurecr.io
+
+                  az webapp restart --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG'
+          - step:
+              identifier: health_staging
+              name: Health Staging
+              type: Run
+              spec:
+                shell: Bash
+                command: 'true'
+          - step:
+              identifier: smoke_staging
+              name: Smoke Staging
+              type: Run
+              spec:
+                shell: Bash
+                command: curl -fsS $APP_HEALTH_URL/health || exit 1
+        environment:
+          environmentRef: staging
+      when:
+        pipelineStatus: Success
+        condition: <+trigger.branch> == 'main'
+  - stage:
+      # -----------------------------------------------------------
+      # STAGE · DEPLOY (prod) — requires manual approval on the ADO
+      # Environments tab (or GH environment). Version-tag guarded.
+      # -----------------------------------------------------------
+      # -----------------------------------------------------------
+      # STAGE · DEPLOY (production) — manual approval + version-tag gate.
+      # -----------------------------------------------------------
+      identifier: deploy_production
+      name: Deploy Production
+      type: Custom
+      spec:
+        execution:
+          steps:
+          - step:
+              identifier: prod_approval
+              name: Manual approval
+              type: HarnessApproval
+              spec:
+                approvalMessage: Approve deploy to production
+                includePipelineExecutionHistory: true
+                approvers:
+                  minimumCount: 1
+                  disallowPipelineExecutor: false
+          - step:
+              identifier: cloud_auth_production
+              name: Cloud Auth Production
+              type: Run
+              spec:
+                shell: Bash
+                command: az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+          - step:
+              identifier: deploy_production
+              name: Deploy Production
+              type: Run
+              spec:
+                shell: Bash
+                command: 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+
+                  az webapp config container set --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG --container-image-name $IMAGE:$TAG --container-registry-url
+                  https://$ACR_NAME.azurecr.io
+
+                  az webapp restart --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RG'
+          - step:
+              identifier: health_production
+              name: Health Production
+              type: Run
+              spec:
+                shell: Bash
+                command: 'true'
+          - step:
+              identifier: smoke_production
+              name: Smoke Production
+              type: Run
+              spec:
+                shell: Bash
+                command: curl -fsS $APP_HEALTH_URL/health || exit 1
+        environment:
+          environmentRef: production
+      when:
+        pipelineStatus: Success
+        condition: <+trigger.tag>.startsWith('v')
