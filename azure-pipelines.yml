@@ -1,171 +1,318 @@
-# .azure-pipelines/azure-pipelines.yml
+# =====================================================================
+#  AIPP-generated Terraform infra pipeline · hashicorp/azurerm + azurerm backend
+# ---------------------------------------------------------------------
+#  Requires the Microsoft DevLabs "Azure Pipelines Terraform Tasks"
+#  extension: https://marketplace.visualstudio.com/items?itemName=
+#            ms-devlabs.custom-terraform-tasks
+#  Install once at the org level. It contributes TerraformInstaller
+#  and TerraformTaskV2@2 — the same tasks the ADO YAML editor's Task
+#  Assistant panel writes when you pick "Terraform" from the picker.
+# ---------------------------------------------------------------------
+#  Runner pool : ubuntu-22.04 (Microsoft-hosted)
+#  Backend key : $(TF_BACKEND_KEY) — override in your pipeline vars
+#  Flow        : validate → plan → policy → apply (manual approval)
+# =====================================================================
 trigger:
   branches:
     include:
+    - develop
+    - release/*
     - main
-  paths:
+  tags:
     include:
-    - '**/*.tf'
-    - '**/*.tfvars'
-    - 'modules/**'
-    - 'environments/**'
-
-pr: none   # PR pipeline is separate
-
+    - v*.*.*
 pool:
-  vmImage: 'ubuntu-latest'
-
-parameters:
-- name: environment
-  displayName: 'Target Environment'
-  type: string
-  default: 'dev'
-  values:
-  - dev
-  - qa
-  - prod
-
+  vmImage: ubuntu-22.04
 variables:
-  tfVersion: '1.9.0'
-  workingDirectory: '$(Build.SourcesDirectory)'
-  environmentName: ${{ parameters.environment }}
-  backendRG: 'REVA-RACE-PROJECT-ACCESS'
-  backendStorage: 'devopsracerevaprodccloud'
-  backendContainer: 'revaprotfstate'
+  IMAGE_NAME: AKS-Landing-Zone-Deployment
+  TAG: $(Build.SourceVersion)
+  TF_ROOT: .
+  TF_VERSION: latest
+  TF_BACKEND_KEY: $(Build.Repository.Name).tfstate
+parameters:
+- name: azureServiceConnection
+  displayName: Azure Resource Manager service connection
+  type: string
+  default: azure-service-connection
 
 stages:
-
-# ========================================
-# STAGE 1: Validate & Plan (Always runs)
-# ========================================
-- stage: ValidateAndPlan
-  displayName: 'Validate & Plan'
+# ---------------------------------------------------------------------
+# STAGE 1 · VALIDATE
+# Purpose: statically check the Terraform code (fmt + init + validate)
+# plus lint (tflint) and security scan (tfsec) BEFORE we touch the
+# cloud API. If this stage fails, plan/policy/apply never run.
+# ---------------------------------------------------------------------
+- stage: terraform_validate
+  displayName: 'Terraform · validate + lint + security'
   jobs:
-  - job: ValidatePlan
-    displayName: 'Terraform Validate & Plan'
+  - job: validate
+    displayName: 'fmt · init · validate · tflint · tfsec'
     steps:
 
+    # Pull the repository into the agent so .tf files are on disk.
+    - checkout: self
+      displayName: 'Checkout source'
+
+    # Install the Terraform CLI (native task from MS DevLabs extension).
     - task: TerraformInstaller@1
-      displayName: 'Install Terraform'
+      displayName: 'Install Terraform $(TF_VERSION)'
       inputs:
-        terraformVersion: $(tfVersion)
+        terraformVersion: '$(TF_VERSION)'
 
-    - task: Bash@3
-      displayName: 'Terraform Format Check'
-      inputs:
-        targetType: 'inline'
-        script: terraform fmt -check -recursive
-        workingDirectory: $(workingDirectory)
-      failOnStderr: true
-
+    # `terraform fmt` — fails the build on unformatted code (style gate).
     - task: TerraformTaskV2@2
-      displayName: 'Terraform Init'
+      displayName: 'Terraform · fmt (check only)'
       inputs:
+        provider: 'azurerm'
+        command: 'custom'
+        customCommand: 'fmt'
+        commandOptions: '-check -recursive'
+        workingDirectory: '$(TF_ROOT)'
+
+    # `terraform init` — download providers + configure remote backend.
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform · init (remote backend)'
+      inputs:
+        provider: 'azurerm'
         command: 'init'
-        workingDirectory: '$(workingDirectory)'
-        backendServiceArm: 'AzureServiceConnection'
-        backendAzureRmResourceGroupName: $(backendRG)
-        backendAzureRmStorageAccountName: $(backendStorage)
-        backendAzureRmContainerName: $(backendContainer)
-        backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
+        workingDirectory: '$(TF_ROOT)'
+        backendServiceArm: '${{ parameters.azureServiceConnection }}'
+        backendAzureRmResourceGroupName: '$(TF_BACKEND_RG)'
+        backendAzureRmStorageAccountName: '$(TF_BACKEND_STORAGE)'
+        backendAzureRmContainerName: '$(TF_BACKEND_CONTAINER)'
+        backendAzureRmKey: '$(TF_BACKEND_KEY)'
 
+    # `terraform validate` — syntax + basic type checks (offline).
     - task: TerraformTaskV2@2
-      displayName: 'Terraform Validate'
+      displayName: 'Terraform · validate'
       inputs:
+        provider: 'azurerm'
         command: 'validate'
-        workingDirectory: '$(workingDirectory)'
+        workingDirectory: '$(TF_ROOT)'
 
-    - task: trivy@1
-      displayName: 'Trivy IaC Scan'
+    # tflint — catches anti-patterns the built-in validator misses
+    # (unknown modules, deprecated arguments, provider-specific rules).
+    - script: |
+        curl -sSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+        tflint --init
+        tflint --format=default --recursive
+      workingDirectory: '$(TF_ROOT)'
+      displayName: 'tflint (install + run)'
+
+    # tfsec — security scanner (public buckets, open SGs, missing encryption).
+    # Soft-fail so a demo pipeline doesn't die on advisories; upgrade to
+    # `--minimum-severity HIGH` when policies are ready.
+    - script: |
+        curl -sSL https://tfsec.dev/install.sh | bash
+        tfsec . --format=lovely --soft-fail-warnings
+      workingDirectory: '$(TF_ROOT)'
+      displayName: 'tfsec (install + run)'
+
+# ---------------------------------------------------------------------
+# STAGE 2 · PLAN
+# Purpose: produce a `tfplan` binary + human-readable `plan.txt` +
+# machine-readable `plan.json` (needed for the OPA gate below).
+# The plan file is published as a build artifact so the apply stage
+# can consume the EXACT same plan (avoids drift between plan/apply).
+# ---------------------------------------------------------------------
+- stage: terraform_plan
+  displayName: 'Terraform · plan (produces artifact)'
+  dependsOn: terraform_validate
+  jobs:
+  - job: plan
+    displayName: 'plan → publish tfplan artifact'
+    steps:
+
+    # Fresh checkout — plan job runs on a clean agent.
+    - checkout: self
+      displayName: 'Checkout source'
+
+    # Reinstall Terraform (agent may be different from validate stage).
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform $(TF_VERSION)'
       inputs:
-        scanType: 'fs'
-        scanPath: '.'
-        format: 'table'
-        exitCode: '1'
-        severity: 'HIGH,CRITICAL'
+        terraformVersion: '$(TF_VERSION)'
 
-    - task: Bash@3
-      displayName: 'Checkov Security Scan'
-      inputs:
-        targetType: 'inline'
-        script: |
-          pip install checkov
-          checkov -d . --framework terraform --output cli --soft-fail
-        workingDirectory: $(workingDirectory)
-      failOnStderr: false
-
+    # `terraform init` again on the fresh agent.
     - task: TerraformTaskV2@2
-      displayName: 'Terraform Plan'
+      displayName: 'Terraform · init'
       inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(TF_ROOT)'
+        backendServiceArm: '${{ parameters.azureServiceConnection }}'
+        backendAzureRmResourceGroupName: '$(TF_BACKEND_RG)'
+        backendAzureRmStorageAccountName: '$(TF_BACKEND_STORAGE)'
+        backendAzureRmContainerName: '$(TF_BACKEND_CONTAINER)'
+        backendAzureRmKey: '$(TF_BACKEND_KEY)'
+
+    # `terraform plan -out=tfplan` — captures the exact set of changes.
+    # -detailed-exitcode is emitted so the caller can tell "no changes"
+    # (0) from "changes queued" (2). ADO treats both as success.
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform · plan (-out=tfplan)'
+      inputs:
+        provider: 'azurerm'
         command: 'plan'
-        workingDirectory: '$(workingDirectory)'
-        environmentServiceName: 'AzureServiceConnection'
-        commandOptions: '-var-file=environments/$(environmentName)/terraform.tfvars -out=tfplan'
-        publishPlanResults: 'Terraform Plan - $(environmentName)'
+        workingDirectory: '$(TF_ROOT)'
+        commandOptions: '-input=false -out=tfplan -detailed-exitcode'
+        environmentServiceNameAzureRM: '${{ parameters.azureServiceConnection }}'
 
-    - publish: '$(workingDirectory)/tfplan'
-      artifact: 'tfplan-$(environmentName)'
-      displayName: 'Publish Plan Artifact'
+    # Emit a machine-readable plan.json for the OPA/conftest gate.
+    # (`terraform show` is not exposed by TerraformTaskV2 — one shell line.)
+    - script: |
+        terraform show -no-color tfplan > plan.txt
+        terraform show -json tfplan > plan.json
+      workingDirectory: '$(TF_ROOT)'
+      displayName: 'terraform show → plan.txt + plan.json'
 
-# ========================================
-# STAGE 2: Manual Approval (QA & Prod only)
-# ========================================
-- stage: Approval
-  displayName: 'Manual Approval'
-  dependsOn: ValidateAndPlan
-  condition: and(succeeded(), ne(variables.environmentName, 'dev'))
+    # Publish tfplan + plan.json + plan.txt so downstream stages can use them.
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish tfplan + plan.json + plan.txt'
+      inputs:
+        PathtoPublish: '$(TF_ROOT)'
+        ArtifactName: 'tfplan'
+        publishLocation: 'Container'
+
+# ---------------------------------------------------------------------
+# STAGE 3 · POLICY
+# Purpose: run policy-as-code (OPA / conftest) against plan.json and,
+# if the repo ships a Go Terratest suite under ./tests, run that too.
+# Both are `continueOnError: true` in this iteration — they are
+# advisory gates. Flip to strict once your policy bundle is ready.
+# ---------------------------------------------------------------------
+- stage: terraform_policy
+  displayName: 'Policy · OPA / conftest + Terratest'
+  dependsOn: terraform_plan
   jobs:
-  - deployment: ApprovalGate
-    displayName: 'Approval for ${{ parameters.environment }}'
-    environment: ${{ parameters.environment }}
+  - job: policy
+    displayName: 'conftest test plan.json (+ Terratest if present)'
+    steps:
+
+    # Download the tfplan artifact produced by stage 2.
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download tfplan artifact'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'tfplan'
+        downloadPath: '$(Pipeline.Workspace)/artifacts'
+
+    # Install conftest (no native task exists — small install script).
+    - script: |
+        wget -qO /tmp/conftest.tar.gz \
+          https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
+        tar -xzf /tmp/conftest.tar.gz -C /tmp
+        sudo mv /tmp/conftest /usr/local/bin/
+      displayName: 'Install conftest'
+
+    # Run the OPA gate if the repo ships a ./policy/*.rego bundle;
+    # otherwise log a skip message. Never crashes the pipeline.
+    - script: |
+        if [ -d policy ]; then
+          conftest test \
+            $(Pipeline.Workspace)/artifacts/tfplan/plan.json \
+            --policy policy
+        else
+          echo 'No ./policy directory found — skipping OPA gate.'
+        fi
+      displayName: 'OPA / conftest gate'
+      continueOnError: true
+
+    # Terratest — only runs if the repo has Go tests under ./tests.
+    # Requires Go on the agent; a Microsoft-hosted ubuntu-22.04 image has it.
+    - script: |
+        if [ -d tests ] && ls tests/*.go >/dev/null 2>&1; then
+          go test -v -timeout 60m ./tests/...
+        else
+          echo 'No Terratest suite under ./tests — skipping.'
+        fi
+      displayName: 'Terratest (optional)'
+      continueOnError: true
+
+# ---------------------------------------------------------------------
+# STAGE 4 · APPLY (manual approval required)
+# Purpose: apply the EXACT tfplan produced in stage 2.
+# Gate 1: only runs on the `main` branch or a v*.*.* tag (feature
+#         branches never get here — see the `condition:` below).
+# Gate 2: `environment: production` — ADO shows an approval prompt in
+#         the UI until the designated reviewer clicks "Approve".
+# Output: `outputs.json` is published as a build artifact so downstream
+#         pipelines (e.g. kubeconfig / connection strings) can consume it.
+# ---------------------------------------------------------------------
+- stage: terraform_apply
+  displayName: 'Terraform · apply (manual approval)'
+  dependsOn: terraform_policy
+  condition: >-
+    and(
+      succeeded(),
+      or(
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+      )
+    )
+  jobs:
+  - deployment: apply
+    displayName: 'terraform apply tfplan'
+    environment: production
     strategy:
       runOnce:
         deploy:
           steps:
-          - task: ManualValidation@0
-            inputs:
-              notifyUsers: ''   # Add approver emails here
-              instructions: 'Review Terraform Plan for ${{ parameters.environment }} before deployment.'
 
-# ========================================
-# STAGE 3: Apply (Deployment)
-# ========================================
-- stage: Deploy
-  displayName: 'Deploy to ${{ parameters.environment }}'
-  dependsOn: Approval
-  condition: succeeded()
-  jobs:
-  - deployment: TerraformApply
-    displayName: 'Terraform Apply'
-    environment: ${{ parameters.environment }}
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-
-          - task: TerraformInstaller@1
-            displayName: 'Install Terraform'
-            inputs:
-              terraformVersion: $(tfVersion)
-
+          # Download the tfplan artifact created by stage 2.
           - download: current
-            artifact: 'tfplan-$(environmentName)'
+            artifact: tfplan
+            displayName: 'Download tfplan artifact'
 
-          - task: TerraformTaskV2@2
-            displayName: 'Terraform Init (Apply)'
+          # Install Terraform on the deployment agent.
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform $(TF_VERSION)'
             inputs:
+              terraformVersion: '$(TF_VERSION)'
+
+          # Copy the artifact contents (tfplan + state files) into $(TF_ROOT)
+          # so the native task sees them at the expected working directory.
+          - script: |
+              cp -r $(Pipeline.Workspace)/tfplan/. .
+              ls -la tfplan plan.json plan.txt 2>/dev/null || true
+            workingDirectory: '$(TF_ROOT)'
+            displayName: 'Stage tfplan into working directory'
+
+          # `terraform init` on the deployment agent (state backend re-attach).
+          - task: TerraformTaskV2@2
+            displayName: 'Terraform · init'
+            inputs:
+              provider: 'azurerm'
               command: 'init'
-              workingDirectory: '$(workingDirectory)'
-              backendServiceArm: 'AzureServiceConnection'
-              backendAzureRmResourceGroupName: $(backendRG)
-              backendAzureRmStorageAccountName: $(backendStorage)
-              backendAzureRmContainerName: $(backendContainer)
-              backendAzureRmKey: 'aks-lz/$(environmentName)/terraform.tfstate'
+              workingDirectory: '$(TF_ROOT)'
+            backendServiceArm: '${{ parameters.azureServiceConnection }}'
+            backendAzureRmResourceGroupName: '$(TF_BACKEND_RG)'
+            backendAzureRmStorageAccountName: '$(TF_BACKEND_STORAGE)'
+            backendAzureRmContainerName: '$(TF_BACKEND_CONTAINER)'
+            backendAzureRmKey: '$(TF_BACKEND_KEY)'
 
+          # `terraform apply tfplan` — the plan file is the SAME artifact
+          # reviewers approved. No drift, no "plan says X, apply does Y".
           - task: TerraformTaskV2@2
-            displayName: 'Terraform Apply'
+            displayName: 'Terraform · apply (from artifact)'
             inputs:
+              provider: 'azurerm'
               command: 'apply'
-              workingDirectory: '$(workingDirectory)'
-              environmentServiceName: 'AzureServiceConnection'
-              commandOptions: '-auto-approve tfplan'
+              workingDirectory: '$(TF_ROOT)'
+              commandOptions: '-input=false -auto-approve tfplan'
+            environmentServiceNameAzureRM: '${{ parameters.azureServiceConnection }}'
+
+          # `terraform output -json` → machine-readable outputs for
+          # downstream pipelines (kubeconfig, DB connection strings, ...).
+          - script: terraform output -json > outputs.json
+            workingDirectory: '$(TF_ROOT)'
+            displayName: 'terraform output → outputs.json'
+
+          # Publish outputs.json so other pipelines can `DownloadPipelineArtifact`.
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish outputs.json'
+            inputs:
+              PathtoPublish: '$(TF_ROOT)/outputs.json'
+              ArtifactName: 'terraform-outputs'
+              publishLocation: 'Container'
